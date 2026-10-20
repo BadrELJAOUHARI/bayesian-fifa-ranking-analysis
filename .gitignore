@@ -1,0 +1,20 @@
+# Quarto render/cache artifacts
+.quarto/
+*_cache/
+*_files/
+
+# R and RStudio project state
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Rendered outputs should not be committed unless intentionally selected
+analysis.docx
+analysis.html
+analysis.pdf
