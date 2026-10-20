@@ -82,7 +82,7 @@ The source currently specifies **Word (`docx`) output**. The original completed 
 
 ## Dataset and attribution
 
-**Source:** Harrachi Mustapha (2026), *[FIFA World Cup Team Dataset](https://www.kaggle.com/datasets/harrachimustapha/fifa-world-cup-team-dataset)*, Kaggle. The original report identifies the dataset as released under **[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)**. Attribution is retained here.
+**Source:** Harrachi Mustapha (2026), *[FIFA World Cup Team Dataset](https://www.kaggle.com/datasets/harrachimustapha/fifa-world-cup-team-dataset)*, Kaggle. The dataset as released under **[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)**. Attribution is retained here.
 
 ## Limitations
 
@@ -90,6 +90,6 @@ The outcome is a count of wins, but a Normal linear regression is used as a simp
 
 ## Author
 
-**Badr El Jaouhari** — Academic project in Bayesian Statistics.
+**Badr El Jaouhari**
 
-For derivations, tables, source references, and the original AI-use disclosure, see the [full report](report.pdf) and [Quarto source](analysis.qmd).
+For derivations, tables, source references, see the [full report](report.pdf) and [Quarto source](analysis.qmd).
