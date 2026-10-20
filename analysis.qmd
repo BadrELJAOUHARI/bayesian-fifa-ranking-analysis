@@ -1,0 +1,825 @@
+---
+title: "FIFA Ranking Points and Recent Football National Team Wins: A Bayesian Linear Regression Analysis"
+author: "Badr El Jaouhari"
+format:
+  docx:
+    toc: false
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: main-code
+#| include: false
+
+rm(list = ls())
+
+library(MASS)
+library(tidyverse)
+library(coda)
+library(broom)
+library(knitr)
+
+set.seed(2026)
+
+
+# Reading the data & Checking missing values ------------------------------
+
+data_raw <- readr::read_csv("train.csv", show_col_types = FALSE)
+
+needed_vars <- c("version", "team", "wins_last_4y", "fifa_points_pre_tournament")
+
+missing_check <- data_raw %>%
+  summarise(across(all_of(needed_vars), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "n_missing")
+
+knitr::kable(missing_check, caption = "Missing values")
+
+# There are 0 missing values in selected variables
+
+# Preparing variables --------------------------------------------------
+
+
+# Outcome: wins_last_4y
+# Predictor: FIFA points before the tournament
+# I standardise FIFA points so beta means the expected change in wins for a one-SD increase
+
+model_data <- data_raw %>%
+  dplyr::select(version, team, wins_last_4y, fifa_points_pre_tournament) %>%
+  mutate(fifa_points_z = as.numeric(scale(fifa_points_pre_tournament)))
+
+y <- model_data$wins_last_4y
+x <- model_data$fifa_points_z
+n <- length(y)
+
+X <- cbind(1, x)
+colnames(X) <- c("alpha", "beta")
+
+n_obs <- n
+mean_wins <- mean(y)
+sd_wins <- sd(y)
+mean_fifa <- mean(model_data$fifa_points_pre_tournament)
+sd_fifa <- sd(model_data$fifa_points_pre_tournament)
+r_xy <- cor(x, y)
+shapiro_wins_p <- shapiro.test(y)$p.value
+cor_result <- cor.test(x, y)
+
+# Compact descriptive table for the report
+data_summary_table <- tibble(
+  Quantity = c("n", "Mean wins", "SD wins", "Mean FIFA points", "SD FIFA points", "Correlation", "Shapiro-Wilk p"),
+  Value = c(n_obs, mean_wins, sd_wins, mean_fifa, sd_fifa, r_xy, shapiro_wins_p)
+) %>%
+  mutate(Value = round(Value, 3))
+
+
+# Descriptive figures --------------------------------------------------
+
+
+p_scatter <- ggplot(model_data, aes(x = fifa_points_z, y = wins_last_4y)) +
+  geom_point(alpha = 0.70) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "FIFA points and recent wins",
+    subtitle = "FIFA points are standardized; outcome is wins in the last four years",
+    x = "Standardized FIFA points before tournament",
+    y = "Wins in last four years"
+  ) +
+  theme_minimal(base_size = 11)
+
+# This histogram is not displayed in the report, but I kept it in the code.
+# It supportsthat wins are not perfectly normal, but not extremely non-normal
+
+p_hist_y <- ggplot(model_data, aes(x = wins_last_4y)) +
+  geom_histogram(bins = 20) +
+  labs(
+    title = "Distribution of wins in the last four years",
+    x = "Wins in last four years",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11)
+
+
+# Priors ---------------------------------------------------------------
+
+
+# Main priors:
+# alpha ~ N(25, 10^2)
+# beta ~ N(0, 5^2)
+# sigma2 ~ IG(2, 49)
+
+
+m0 <- c(25, 0)
+V0 <- diag(c(10^2, 5^2))
+a0 <- 2
+b0 <- 49
+
+prior_table <- tibble(
+  Parameter = c("alpha", "beta", "sigma2"),
+  Prior = c("N(25, 10^2)", "N(0, 5^2)", "IG(2, 49)"),
+  Rationale = c(
+    "Centered near the observed average number of wins",
+    "Centered at zero so the prior does not assume a positive effect",
+    "Keeps the residual variance on a plausible scale for wins"
+  )
+)
+
+# 5. Gibbs sampler
+
+
+run_gibbs <- function(y, X, m0, V0, a0, b0,
+                      n_iter = 10000, burn = 2000, seed = 1) {
+  
+  set.seed(seed)
+  n <- length(y)
+  p <- ncol(X)
+  
+  samples <- matrix(NA, nrow = n_iter, ncol = p + 1)
+  colnames(samples) <- c(colnames(X), "sigma2")
+  
+  # Starting values from classical regression (for stability)
+  lm_start <- lm(y ~ X[, 2])
+  theta <- as.numeric(coef(lm_start))
+  sigma2 <- var(residuals(lm_start))
+  
+  V0_inv <- solve(V0)
+  
+  for (iter in 1:n_iter) {
+    
+    # Step 1: sample the regression coefficients
+    # theta | sigma2, y has a Normal conditional posterior
+
+    Vn <- solve(V0_inv + (t(X) %*% X) / sigma2)
+    mn <- Vn %*% (V0_inv %*% m0 + (t(X) %*% y) / sigma2)
+    theta <- as.numeric(MASS::mvrnorm(1, mu = as.numeric(mn), Sigma = Vn))
+    
+    # Step 2: sample residual variance.
+    # sigma2 | theta, y has an Inverse-Gamma conditional posterior
+
+    residuals_now <- as.numeric(y - X %*% theta)
+    SSR <- sum(residuals_now^2)
+    a_n <- a0 + n / 2
+    b_n <- b0 + SSR / 2
+    sigma2 <- 1 / rgamma(1, shape = a_n, rate = b_n)
+    
+    samples[iter, ] <- c(theta, sigma2)
+  }
+  
+  post <- samples[(burn + 1):n_iter, , drop = FALSE]
+  list(samples = samples, post = post)
+}
+
+
+fit1 <- run_gibbs(y, X, m0, V0, a0, b0, seed = 101)
+fit2 <- run_gibbs(y, X, m0, V0, a0, b0, seed = 102)
+fit3 <- run_gibbs(y, X, m0, V0, a0, b0, seed = 103)
+
+post_main <- rbind(fit1$post, fit2$post, fit3$post)
+
+mcmc_list <- mcmc.list(mcmc(fit1$post), mcmc(fit2$post), mcmc(fit3$post))
+
+
+# Convergence diagnostics
+
+rhat <- gelman.diag(mcmc_list, autoburnin = FALSE, multivariate = FALSE)
+rhat_table <- as.data.frame(rhat$psrf) %>%
+  rownames_to_column("Parameter") %>%
+  rename(Rhat = `Point est.`, Rhat_upper = `Upper C.I.`)
+
+ess_values <- effectiveSize(mcmc_list)
+ess_table <- tibble(Parameter = names(ess_values), ESS = as.numeric(ess_values))
+
+diagnostics_table <- rhat_table %>%
+  left_join(ess_table, by = "Parameter")
+
+trace_data <- bind_rows(
+  as_tibble(fit1$post) %>% mutate(iter = 1:n(), chain = "chain 1"),
+  as_tibble(fit2$post) %>% mutate(iter = 1:n(), chain = "chain 2"),
+  as_tibble(fit3$post) %>% mutate(iter = 1:n(), chain = "chain 3")
+) %>%
+  pivot_longer(cols = c(alpha, beta, sigma2), names_to = "parameter", values_to = "value")
+
+p_trace <- ggplot(trace_data, aes(x = iter, y = value, color = chain)) +
+  geom_line(alpha = 0.40) +
+  facet_wrap(~ parameter, scales = "free_y") +
+  labs(
+    title = "Trace plots for Gibbs sampler",
+    x = "Post-burn-in iteration",
+    y = "Sampled value"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+
+# Posterior summaries
+
+posterior_summary_raw <- tibble(
+  Parameter = colnames(post_main),
+  EAP = colMeans(post_main),
+  PSD = apply(post_main, 2, sd),
+  lower_95 = apply(post_main, 2, quantile, 0.025),
+  upper_95 = apply(post_main, 2, quantile, 0.975)
+)
+
+prob_beta_positive <- mean(post_main[, "beta"] > 0)
+
+posterior_diagnostics_table <- posterior_summary_raw %>%
+  left_join(diagnostics_table, by = "Parameter") %>%
+  mutate(
+    EAP = round(EAP, 2),
+    PSD = round(PSD, 2),
+    `95% CCI` = paste0("[", round(lower_95, 2), ", ", round(upper_95, 2), "]"),
+    Rhat = round(Rhat, 3),
+    ESS = round(ESS, 0)
+  ) %>%
+  dplyr::select(Parameter, EAP, PSD, `95% CCI`, Rhat, ESS)
+
+alpha_mean <- posterior_summary_raw$EAP[posterior_summary_raw$Parameter == "alpha"]
+beta_mean <- posterior_summary_raw$EAP[posterior_summary_raw$Parameter == "beta"]
+beta_low <- posterior_summary_raw$lower_95[posterior_summary_raw$Parameter == "beta"]
+beta_high <- posterior_summary_raw$upper_95[posterior_summary_raw$Parameter == "beta"]
+sigma2_mean <- posterior_summary_raw$EAP[posterior_summary_raw$Parameter == "sigma2"]
+sigma_resid_mean <- sqrt(sigma2_mean)
+
+p_beta_density <- as_tibble(post_main) %>%
+  ggplot(aes(x = beta)) +
+  geom_density(fill = "grey70", alpha = 0.70) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Posterior distribution of beta",
+    subtitle = "Dashed line shows beta = 0",
+    x = "beta",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 11)
+
+
+# Frequentist comparison and residual checks
+
+
+classical_fit <- lm(wins_last_4y ~ fifa_points_z, data = model_data)
+classical_table <- broom::tidy(classical_fit, conf.int = TRUE)
+
+beta_lm <- classical_table$estimate[classical_table$term == "fifa_points_z"]
+beta_lm_se <- classical_table$std.error[classical_table$term == "fifa_points_z"]
+beta_lm_low <- classical_table$conf.low[classical_table$term == "fifa_points_z"]
+beta_lm_high <- classical_table$conf.high[classical_table$term == "fifa_points_z"]
+p_two_sided <- classical_table$p.value[classical_table$term == "fifa_points_z"]
+p_one_sided <- ifelse(beta_lm > 0, p_two_sided / 2, 1 - p_two_sided / 2)
+r_squared <- summary(classical_fit)$r.squared
+
+model_data <- model_data %>%
+  mutate(
+    lm_fitted = fitted(classical_fit),
+    lm_residuals = residuals(classical_fit)
+  )
+
+shapiro_residuals_p <- shapiro.test(model_data$lm_residuals)$p.value
+
+# These normality diagnostics are kept in the code but not displayed in the report
+# The Q-Q plot showed that the middle of the residuals is acceptable even though the tails are not perfect
+
+p_resid_hist <- ggplot(model_data, aes(x = lm_residuals)) +
+  geom_histogram(bins = 20) +
+  labs(title = "Residual distribution from classical linear regression", x = "Residuals", y = "Frequency") +
+  theme_minimal(base_size = 11)
+
+p_resid_qq <- ggplot(model_data, aes(sample = lm_residuals)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(title = "Q-Q plot of residuals", x = "Theoretical quantiles", y = "Sample quantiles") +
+  theme_minimal(base_size = 11)
+
+
+# Bayesian p-value under H0: beta = 0
+
+
+# Bayesian p-value logic kept here in the code:
+# Under H0, beta = 0, so FIFA points should not predict wins.
+# I simulate y_rep from the intercept-only model and calculate cor(x, y_rep). If the observed correlation is far in the tail of replicated correlations, then the null model does not reproduce the observed pattern well
+
+T_obs <- cor(x, y)
+n_iter_null <- 10000
+burn_null <- 2000
+alpha_null <- mean(y)
+sigma2_null <- var(y)
+null_samples <- matrix(NA, nrow = n_iter_null, ncol = 2)
+colnames(null_samples) <- c("alpha", "sigma2")
+m_alpha0 <- 25
+s_alpha0 <- 10
+
+for (iter in 1:n_iter_null) {
+  var_alpha <- 1 / (1 / s_alpha0^2 + n / sigma2_null)
+  mean_alpha <- var_alpha * (m_alpha0 / s_alpha0^2 + sum(y) / sigma2_null)
+  alpha_null <- rnorm(1, mean_alpha, sqrt(var_alpha))
+  
+  residuals_null <- y - alpha_null
+  SSR_null <- sum(residuals_null^2)
+  a_null <- a0 + n / 2
+  b_null <- b0 + SSR_null / 2
+  sigma2_null <- 1 / rgamma(1, shape = a_null, rate = b_null)
+  
+  null_samples[iter, ] <- c(alpha_null, sigma2_null)
+}
+
+post_null <- null_samples[(burn_null + 1):n_iter_null, , drop = FALSE]
+
+n_ppc <- 5000
+draw_ids <- sample(1:nrow(post_null), n_ppc)
+T_rep <- rep(NA, n_ppc)
+set.seed(777)
+
+for (s in 1:n_ppc) {
+  alpha_s <- post_null[draw_ids[s], "alpha"]
+  sigma2_s <- post_null[draw_ids[s], "sigma2"]
+  y_rep <- rnorm(n, mean = alpha_s, sd = sqrt(sigma2_s))
+  T_rep[s] <- cor(x, y_rep)
+}
+
+bayesian_p_value <- (sum(T_rep >= T_obs) + 1) / (n_ppc + 1)
+
+p_bayes_pvalue <- tibble(T_rep = T_rep) %>%
+  ggplot(aes(x = T_rep)) +
+  geom_histogram(bins = 35) +
+  geom_vline(xintercept = T_obs, linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Bayesian p-value under H0: beta = 0",
+    subtitle = "Dashed line is the observed correlation",
+    x = "Replicated correlation under H0",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11)
+
+
+# Prior sensitivity with J, 2J, and 3J
+
+classical_beta_se <- summary(classical_fit)$coefficients["fifa_points_z", "Std. Error"]
+J_base <- 1
+
+J_settings <- tibble(
+  prior = c("J", "2J", "3J"),
+  description = c("weak prior information", "main prior information", "stronger prior information"),
+  J_multiplier = c(1, 2, 3),
+  J_current = J_base * J_multiplier
+) %>%
+  mutate(beta_prior_mean = 0, beta_prior_sd = sqrt(n / J_current) * classical_beta_se)
+
+sensitivity_results <- tibble()
+
+for (k in 1:nrow(J_settings)) {
+  beta_sd_k <- J_settings$beta_prior_sd[k]
+  V0_k <- diag(c(10^2, beta_sd_k^2))
+  
+  fit_k_1 <- run_gibbs(y, X, m0 = c(25, 0), V0 = V0_k, a0 = a0, b0 = b0,
+                       n_iter = 8000, burn = 2000, seed = 900 + k)
+  fit_k_2 <- run_gibbs(y, X, m0 = c(25, 0), V0 = V0_k, a0 = a0, b0 = b0,
+                       n_iter = 8000, burn = 2000, seed = 950 + k)
+  
+  beta_draws <- c(fit_k_1$post[, "beta"], fit_k_2$post[, "beta"])
+  
+  sensitivity_results <- bind_rows(sensitivity_results, tibble(
+    prior = J_settings$prior[k],
+    J_current = J_settings$J_current[k],
+    beta_prior_sd = beta_sd_k,
+    beta_EAP = mean(beta_draws),
+    beta_PSD = sd(beta_draws),
+    beta_low_95 = quantile(beta_draws, 0.025),
+    beta_high_95 = quantile(beta_draws, 0.975),
+    P_beta_positive = mean(beta_draws > 0)
+  ))
+}
+
+sensitivity_table <- sensitivity_results %>%
+  mutate(
+    `Prior SD` = round(beta_prior_sd, 2),
+    `EAP beta` = round(beta_EAP, 2),
+    `95% CCI` = paste0("[", round(beta_low_95, 2), ", ", round(beta_high_95, 2), "]"),
+    `P(beta > 0)` = round(P_beta_positive, 3)
+  ) %>%
+  dplyr::select(Prior = prior, J = J_current, `Prior SD`, `EAP beta`, `95% CCI`, `P(beta > 0)`)
+
+# Prior sensitivity plot is kept in the code but not displayed in the report.
+
+p_sensitivity <- sensitivity_results %>%
+  ggplot(aes(x = prior, y = beta_EAP)) +
+  geom_col(width = 0.55) +
+  geom_errorbar(aes(ymin = beta_low_95, ymax = beta_high_95), width = 0.15) +
+  coord_flip() +
+  labs(
+    title = "Prior sensitivity for beta",
+    subtitle = "J, 2J, and 3J use different amounts of prior information",
+    x = "Prior setting",
+    y = "Posterior mean beta with 95% credible interval"
+  ) +
+  theme_minimal(base_size = 11)
+
+
+# Classical comparison table and Bayesian p-value table
+
+bayes_classical_table <- tibble(
+  Analysis = c(
+    "Bayesian posterior", "Bayesian posterior", "Bayesian p-value", "Bayesian p-value",
+    "Classical OLS", "Classical OLS", "Classical OLS"
+  ),
+  Quantity = c(
+    "Posterior mean beta", "P(beta > 0 | data)", "Observed correlation", "p_B under H0: beta = 0",
+    "OLS slope", "One-sided p-value", "R-squared"
+  ),
+  Result = c(
+    round(beta_mean, 3),
+    ifelse(prob_beta_positive == 1, "> .999", round(prob_beta_positive, 3)),
+    round(T_obs, 3),
+    signif(bayesian_p_value, 3),
+    round(beta_lm, 3),
+    signif(p_one_sided, 3),
+    round(r_squared, 3)
+  )
+)
+
+
+# Residual analysis: Teams who underperformed/overperformed their expected wins (extension)
+
+
+# This additional part is kept compact in the report as a small table.
+# The longer residual graph is created in code but not displayed in the report
+# Residual = observed wins - posterior mean predicted wins
+
+alpha_post_mean <- mean(post_main[, "alpha"])
+beta_post_mean <- mean(post_main[, "beta"])
+
+model_data_creative <- model_data %>%
+  mutate(
+    predicted_wins = alpha_post_mean + beta_post_mean * fifa_points_z,
+    residual_wins = wins_last_4y - predicted_wins,
+    label = paste(team, version)
+  )
+
+top_overperformers <- model_data_creative %>%
+  arrange(desc(residual_wins)) %>%
+  dplyr::select(version, team, wins_last_4y, predicted_wins, residual_wins) %>%
+  slice_head(n = 4) %>%
+  mutate(Type = "Overperformed")
+
+top_underperformers <- model_data_creative %>%
+  arrange(residual_wins) %>%
+  dplyr::select(version, team, wins_last_4y, predicted_wins, residual_wins) %>%
+  slice_head(n = 4) %>%
+  mutate(Type = "Underperformed")
+
+performance_table <- bind_rows(top_overperformers, top_underperformers) %>%
+  mutate(
+    `Team and year` = paste(team, version),
+    `Observed wins` = wins_last_4y,
+    `Predicted wins` = round(predicted_wins, 2),
+    `Residual wins` = round(residual_wins, 2)
+  ) %>%
+  dplyr::select(Type, `Team and year`, `Observed wins`, `Predicted wins`, `Residual wins`)
+
+performance_surprises <- model_data_creative %>%
+  arrange(desc(abs(residual_wins))) %>%
+  slice_head(n = 20) %>%
+  mutate(type = if_else(residual_wins > 0, "Overperformed model expectation", "Underperformed model expectation"))
+
+p_surprises <- performance_surprises %>%
+  ggplot(aes(x = reorder(label, residual_wins), y = residual_wins)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ type, scales = "free_y") +
+  labs(
+    title = "Teams that overperformed or underperformed FIFA-point expectations",
+    subtitle = "Residual = observed wins - posterior mean predicted wins",
+    x = "Team and World Cup year",
+    y = "Residual wins"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+## 1. Introduction
+
+In football, FIFA points are the ranking points used by the International Federation of Association Football to compare national teams. The FIFA ranking system adds or subtracts points after international matches, depending on the match result and also on the strength of the opponent (Fédération Internationale de Football Association \[FIFA\], 2024). Since the 2026 World Cup starts this month of June 2026, these rankings are especially relevant because they are often used to judge which teams are expected to be stronger and potentially go further in the tournament rounds (FIFA, 2026). This is what motivated the idea of doing this report.
+
+However, FIFA points are also partly based on past match results. For that reason, I do not treat this report as a causal analysis. I am not asking whether FIFA points cause teams to win more matches. Instead, the question is more descriptive: do teams with higher pre-tournament FIFA points also have more wins in the four years before the World Cup? In other words, I use this model to study how well FIFA points reflect recent winning volume.
+
+The outcome is the number of wins in the previous four years, and the predictor is standardized FIFA points before the tournament. The model is:
+
+$$
+wins_i = \alpha + \beta x_i + \varepsilon_i, \qquad \varepsilon_i \sim N(0,\sigma^2),
+$$
+
+where $x_i$ is standardized FIFA points. The parameter of interest is $\beta$. Since the predictor is standardized, $\beta$ is the expected change in wins for a one-standard-deviation increase in FIFA points. The main substantive hypothesis is:
+
+$$
+H_1: \beta > 0.
+$$
+
+The Bayesian procedure is appropriate here for three reasons. First, it gives the full posterior distribution of $\beta$, not only a point estimate. Second, it lets me directly calculate $P(\beta>0\mid \text{data})$, which is exactly linked to the research question. Third, the Normal linear regression model with Normal priors and an Inverse-Gamma prior for $\sigma^2$ has closed-form conditional posteriors, so I can estimate it with a hand-coded Gibbs sampler instead of relying on pre-packaged estimation functions. For Bayesian testing, I use a posterior predictive Bayesian p-value under the null model $H_0:\beta=0$.
+
+## 2. Data
+
+The data used in this report is the FIFA World Cup Team Dataset available on Kaggle (Harashi, 2026). This dataset contains team-level information for World Cup tournaments from 2002 to 2026. Each row represents one national team before a specific World Cup, so the data is useful for comparing teams based on pre-tournament characteristics and recent performance. For this report, I only use the variables that are directly linked to my research question: the number of wins in the four years before the World Cup, `wins_last_4y`, and the FIFA points before the tournament, `fifa_points_pre_tournament`.
+
+The dataset is publicly available on Kaggle, and is shared under the Creative Commons Attribution 4.0 International license. This means that the data can be reused and adapted, as long as proper credit is given to the original creator (Creative Commons, n.d.).
+
+(The following short variable explanation was removed from the final Word report to save space, but I keep it here in the Quarto document for transparency.)
+
+The two main variables used in this report are:
+
+$$ wins\_last\_4y $$
+
+and:
+
+$$ fifa\_points\_pre\_tournament. $$
+
+The variable $wins\_last\_4y$ is the number of wins the team achieved in the four years before the World Cup. The variable $fifa\_points\_pre\_tournament$ is the number of FIFA points the team had before the tournament.
+
+I standardized FIFA points using:
+
+$$ x_i = \frac{FIFA_i - \overline{FIFA}}{s_{FIFA}}. $$
+
+This makes the interpretation of the slope easier, because $\beta$ becomes the expected change in wins for a one-standard-deviation increase in FIFA points.
+
+The dataset used in the model has $n = `r n_obs`$ observations. The average number of wins in the last four years is about `r round(mean_wins, 2)`, with a standard deviation of about `r round(sd_wins, 2)`. The mean FIFA-points value is about `r round(mean_fifa, 2)`, with a standard deviation of about `r round(sd_fifa, 2)`. The correlation between standardized FIFA points and wins is:
+
+$$ r = `r round(r_xy, 3)`. $$
+
+This indicates a positive but moderate relationship. It is not a perfect relationship, which is expected in football, because recent wins are influenced by many other things besides FIFA points.
+
+```{r}
+#| label: tbl-descriptive-statistics
+#| tbl-cap: "Descriptive statistics"
+
+knitr::kable(data_summary_table)
+```
+
+```{r}
+#| label: fig-scatter-fifa-wins
+#| include: false
+#| fig-cap: "Scatterplot of standardized FIFA points and wins."
+#| fig-width: 7
+#| fig-height: 4
+#| out-width: "100%"
+
+p_scatter
+```
+
+(The scatterplot code is kept in the Quarto source, but the graph and its discussion were not displayed in the final Word report to reduce the number of pages. Removed text: the scatterplot shows a positive relationship. Teams with higher FIFA points tend to have more wins, but the points are quite spread out. This is important because it shows that FIFA points capture part of recent win volume, but not all of it. The fitted line goes upward, but the variation around the line is still large.)
+
+```{r}
+#| label: fig-hist-wins
+#| fig-cap: "Histogram of wins in the last four years."
+#| fig-width: 7
+#| fig-height: 4
+#| out-width: "100%"
+
+p_hist_y
+```
+
+The histogram shows that the wins variable is roughly centered around the mid-20s. The Shapiro-Wilk test gives:
+
+$$ p = `r round(shapiro_wins_p, 3)`. $$
+
+At the 5% cut-off level, this suggests that the outcome is not perfectly normally distributed. However, the p-value is close to 0.05, and the distribution is not extremely non-normal, and add to that the  mean of the count variable is relatively large, I decided to treat the Normal model as a reasonable approximation. I will discuss this again in the limitations section.
+
+## 3. Bayesian model, priors, and Gibbs sampler
+
+The likelihood is:
+
+$$
+y_i \mid \alpha,\beta,\sigma^2 \sim N(\alpha + \beta x_i, \sigma^2).
+$$
+
+I use the following priors:
+
+$$
+\alpha \sim N(25,10^2), \qquad
+\beta \sim N(0,5^2), \qquad
+\sigma^2 \sim IG(2,49).
+$$
+
+The prior for $\alpha$ is centered at 25 because the average number of wins is around that number. The prior standard deviation is 10, which is wide enough to allow a broad range of plausible intercept values.
+
+The prior for $\beta$ is centered at zero. This is important because I do not want the prior to force the conclusion that FIFA points are positively associated with wins. Since FIFA points are standardized, a slope of 5 would already mean that a team one standard deviation above the mean FIFA-points value is expected to have 5 more wins. In football terms, this is already a large effect, so $N(0,5^2)$ is still a fairly broad prior.
+
+The prior for $\sigma^2$ puts the residual variance on approximately the same scale as the observed outcome. Since the standard deviation of wins is around 7, a variance around $7^2=49$ is reasonable as a prior scale. The prior is not meant to be very strong, but it prevents the variance from being completely unrealistic.
+
+```{r}
+#| label: tbl-priors
+#| include: false
+#| tbl-cap: "Priors and rationale."
+knitr::kable(prior_table)
+```
+
+(This prior-motivation table was removed from the final Word report to save space, but the code is kept here in the Quarto document)
+
+For the Gibbs sampler, define $\theta=(\alpha,\beta)'$ and $y\sim N(X\theta,\sigma^2I)$. The prior is $\theta\sim N(m_0,V_0)$. The conditional posterior for the regression coefficients is:
+
+$$
+\theta\mid \sigma^2,y \sim N(m_n,V_n),
+$$
+
+where:
+
+$$
+V_n=\left(V_0^{-1}+\frac{1}{\sigma^2}X'X\right)^{-1},
+\qquad
+m_n=V_n\left(V_0^{-1}m_0+\frac{1}{\sigma^2}X'y\right).
+$$
+
+The conditional posterior for the variance is:
+
+$$
+\sigma^2\mid \theta,y \sim IG\left(a_0+\frac{n}{2},\ b_0+\frac{1}{2}\sum_{i=1}^n (y_i-\alpha-\beta x_i)^2\right).
+$$
+
+In each iteration I sample $\theta$ from its Normal conditional posterior and then sample $\sigma^2$ from its Inverse-Gamma conditional posterior. I ran three chains with 10,000 iterations and discarded the first 2,000 as burn-in.
+
+## 4. Convergence and Bayesian estimation results
+
+```{r}
+#| label: fig-trace
+#| fig-cap: "Trace plots for the Gibbs sampler."
+#| fig-width: 6.4
+#| fig-height: 3.1
+#| out-width: "100%"
+p_trace
+```
+
+The trace plots show no clear trend and the three chains overlap well forming a hairy fat caterpillar like figure. This suggests that the chains are sampling from the same posterior distribution. The $\hat{R}$ values are approximately 1 and the effective sample sizes are large, which supports convergence.
+
+```{r}
+#| label: tbl-posterior-diagnostics
+#| tbl-cap: "Posterior summaries and convergence diagnostics."
+knitr::kable(posterior_diagnostics_table)
+```
+
+The posterior mean of $\beta$ is `r round(beta_mean, 2)`. This means that a team one standard deviation above average FIFA points is expected to have about `r round(beta_mean, 2)` more wins in the previous four years. The 95% credible interval is $[`r round(beta_low, 2)`, `r round(beta_high, 2)`]$, which is fully above zero. The posterior probability of the main hypothesis is:
+
+$$
+P(\beta>0\mid \text{data}) > .999.
+$$
+
+This is more informative than just saying that the slope is significant. It says that, after combining the prior and the data, practically all posterior mass for $\beta$ is above zero.
+
+```{r}
+#| label: fig-beta-density
+#| fig-cap: "Posterior distribution of beta."
+#| fig-width: 5.8
+#| fig-height: 3.1
+#| out-width: "85%"
+p_beta_density
+```
+
+The posterior distribution is clearly away from the prior centre of zero. For me, this is important because I did not choose a prior that already forced the result to be positive. The prior still allowed negative slopes, values close to zero, and positive slopes. After using the data, however, most of the posterior distribution is concentrated on positive values of $\beta$. This makes me more confident that the positive relationship comes mainly from the data, and not from a prior that already assumed the answer. I also return to this point in the next section, where I check the sensitivity of the results to different prior settings.
+
+## 5. Bayesian p-value and sensitivity to prior information
+
+For Bayesian testing, I use a posterior predictive check under:
+
+$$
+H_0:\beta=0.
+$$
+
+Under this null model, FIFA points do not help explain wins. I fit an intercept-only Bayesian model and simulate replicated datasets from it. For each replicated dataset I calculate the same statistic as in the observed data:
+
+$$
+T(y)=cor(x,y).
+$$
+
+I chose this statistic because the hypothesis is about a positive association between FIFA points and wins. In this regression, the correlation captures the same main pattern as the slope $\beta$. I generated 5,000 replicated datasets from the null model after discarding 2,000 burn-in iterations, and computed $cor(x, y^{rep})$ for each one.
+
+The observed value is $T_{obs}=`r round(T_obs, 3)`$. The Bayesian p-value is:
+
+$$
+p_B=P(T(y^{rep})\geq T_{obs}\mid \text{data},H_0).
+$$
+
+```{r}
+#| label: fig-bayes-pvalue
+#| fig-cap: "Posterior predictive Bayesian p-value under the null model."
+#| fig-width: 5.8
+#| fig-height: 3.2
+#| out-width: "88%"
+p_bayes_pvalue
+```
+
+The observed correlation is far in the right tail of the replicated correlations. The resulting Bayesian p-value is `r signif(bayesian_p_value, 3)`. This indicates that datasets generated under the null model rarely produce a correlation as large as the one observed. Therefore, the null model ($\beta=0$) does not appear to reproduce this feature of the data well. Because the Bayesian p-value is a posterior predictive model-checking measure rather than a direct probability that the null hypothesis is false, it should not be interpreted as an exact decision rule. Nevertheless, the very small value suggests a substantial discrepancy between the observed data and the predictions of the null model.
+
+For sensitivity analysis, I vary the amount of prior information for $\beta$ using fractions on information parameter $J$, $2J$, and $3J$. The prior remains centered at the null value $\beta=0$, but the prior standard deviation changes as:
+
+$$
+\sigma_{\beta,J}=\sqrt{\frac{n}{J}}\times SE_{OLS}(\hat{\beta}).
+$$
+
+Larger values of $J$ correspond to increasingly informative priors because they reduce the prior standard deviation and concentrate more probability mass around $\beta=0$. This checks whether the posterior conclusion depends on one arbitrary prior scale.
+
+```{r}
+#| label: tbl-sensitivity
+#| tbl-cap: "Prior sensitivity for beta using J, 2J, and 3J."
+knitr::kable(sensitivity_table)
+```
+
+The posterior mean of $\beta$ remains around 2.2 under $J$, $2J$, and $3J$, and the credible interval stays above zero. Therefore, the conclusion is stable under different amounts of prior information.
+
+```{r}
+#| label: fig-sensitivity-hidden
+#| include: false
+#| fig-cap: "Prior sensitivity plot for beta."
+#| fig-width: 6
+#| fig-height: 3.2
+
+p_sensitivity
+```
+
+(The prior sensitivity plot was created and kept in the Quarto source, but it was not displayed in the final Word report because the table was enough and the page limit was tight)
+
+## 6. Classical frequentist comparison and residual check
+
+The frequentist version of what I did is the same linear regression estimated with ordinary least squares. It gives the same substantive direction: the slope is positive and the one-sided p-value is very small.
+
+```{r}
+#| label: tbl-bayes-classical
+#| tbl-cap: "Bayesian and classical comparison."
+knitr::kable(bayes_classical_table)
+```
+
+The classical result answers a different kind of question. The p-value is about how unusual the observed slope would be in repeated samples if the true slope were zero. The Bayesian analysis instead gives a posterior distribution for $\beta$ and allows a direct statement about $P(\beta>0\mid \text{data})$. For this research question, I find the Bayesian interpretation more natural because the question is directly about uncertainty in the slope itself. At the same time, the classical model is useful as a check, because it leads to the same broad conclusion.
+
+The classical $R^2$ is `r round(r_squared, 3)`, so FIFA points explain about `r round(100*r_squared, 1)`% of the variation in recent wins. This is enough to show a real association, but it also shows that FIFA points alone are incomplete.
+
+As a small extension, I use the posterior mean regression line to identify teams that overperformed or underperformed the model expectation. I compute:
+
+$$
+residual_i=wins_i-\widehat{wins}_i.
+$$
+
+Positive residuals mean that a team won more matches often than expected from FIFA points alone, while negative residuals mean that a team won less matches often than expected.
+
+```{r}
+#| label: tbl-performance
+#| tbl-cap: "Selected teams that overperformed or underperformed the model expectation."
+knitr::kable(performance_table)
+```
+
+This part adds a football interpretation to the residuals. It shows that FIFA points are useful, but there are still teams whose recent win volume is higher or lower than what the one-predictor model expects.
+
+```{r}
+#| label: fig-residual-surprises-hidden
+#| include: false
+#| fig-cap: "Teams that overperformed or underperformed FIFA-point expectations."
+#| fig-width: 7
+#| fig-height: 4.5
+
+p_surprises
+```
+
+(The longer residual graph was created in the code, but it was not displayed in the final Word report. I kept the smaller residual table instead.)
+
+## 7. Reflection and conclusion
+
+The Bayesian estimation gives a clear substantive result. The posterior mean of $\beta$ is about `r round(beta_mean, 2)`, with a 95% credible interval from `r round(beta_low, 2)` to `r round(beta_high, 2)`. Since the full interval is above zero and $P(\beta>0\mid \text{data})>.999$, the posterior as a whole supports a positive association between FIFA points and recent wins for the national teams. The sensitivity analysis also matters here: even when I changed the amount of prior information using $J$, $2J$, and $3J$, the posterior conclusion stayed the same, which demonstrates that the result is not mainly a consequence of one specific prior choice.
+
+The Bayesian p-value supports the same conclusion from a model-checking perspective. Under the null model $H_0:\beta=0$, replicated datasets almost never produced a correlation as large as the observed one. This does not mean the Bayesian p-value is identical to a classical p-value; I interpret it as showing that the no-slope model does not reproduce the observed association well.
+
+Compared with the frequentist classical approach, the Bayesian approach is more transparent about uncertainty in the parameter. The classical model gives an OLS estimate, confidence interval, and p-value. These are useful, but their interpretation depends on repeated-sampling logic. The Bayesian model gives a posterior distribution and makes it possible to say directly how much posterior probability supports the positive slope. It also forces me to state the prior assumptions clearly and check whether the conclusion is sensitive to them.
+
+There are also limitations. First, `wins_last_4y` is a count variable, while I model it using Normal linear regression. This is a simplification, because a Poisson or negative binomial model would be more natural for a fully count-based analysis. However, in this case, the Normal model is still acceptable because the histogram of `wins_last_4y` does not show a strongly skewed distribution. Second, FIFA points and wins are conceptually related because both are based on match results. Therefore, this is not a causal analysis. Third, the model uses only one predictor while other covariates like number of matches played could potentially improve the model.
+
+```{r}
+#| label: fig-residual-diagnostics-hidden
+#| include: false
+#| fig-cap: "Residual diagnostics for the Normal linear regression model."
+#| fig-width: 7
+#| fig-height: 4
+
+p_resid_hist
+p_resid_qq
+```
+
+(The residual histogram and QQ plot are kept in the Quarto source because they support the Normal modelling choice, but they were not displayed in the final Word report due to the page limit.)
+
+Overall, I conclude that FIFA points do reflect recent win volume, but only partly. Higher FIFA points are clearly associated with more recent wins, but the modest $R^2$ and the residual analysis show that FIFA points are far from a complete measure of team performance. The main value of the Bayesian analysis is that it gives a full posterior interpretation of this association and shows that the conclusion is stable across prior sensitivity checks.
+
+## 8. References
+
+Creative Commons. (n.d.). *Attribution 4.0 International (CC BY 4.0)*. <https://creativecommons.org/licenses/by/4.0/>
+
+Fédération Internationale de Football Association. (2024). *FIFA/Coca-Cola Men’s World Ranking procedures*. FIFA. <https://inside.fifa.com/fifa-world-ranking/procedure-men>
+
+Fédération Internationale de Football Association. (2026). *FIFA World Cup 2026 scores & fixtures*. FIFA. <https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures>
+
+Harrachi Mustapha. (2026). *FIFA World Cup Team Dataset*. Kaggle. <https://www.kaggle.com/datasets/harrachimustapha/fifa-world-cup-team-dataset>
+
+## 9. AI Statement
+
+I used ChatGPT 5.5 as a support tool during the preparation of this report. I mainly used it to help me debug parts of the R code, improve the structure and readability of the code, refine some graphs, and polish the wording of some paragraphs. The main ideas, text, procedure, statistical steps, interpretation, and final decisions were my own and were based on the Bayesian Statistics course material.
+
+Examples of prompts I used include:
+
+-   “Is there a strong rationale for using a Bayesian p-value in this analysis?”
+-   “How can I make this graph look clearer and more professional?”
+-   “Can you make this sound clearer while keeping my own argument?”
+
+I used the AI output critically and did not copy results without checking them against my code, the data, and the course material.
